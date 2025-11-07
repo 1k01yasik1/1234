@@ -1,32 +1,42 @@
-# ============================================================
-# Satellite Visualiser — FIXED FULL VERSION
-# OpenGL 3.3 Core + PyQt6 + PyOpenGL
-# ФИКС: QT_OPENGL=desktop (главная проблема)
-# ============================================================
-
 from __future__ import annotations
-import os
-os.environ["QT_OPENGL"] = "desktop"
 
 import math
+import os
 import time
-import ctypes
 from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Callable, Iterable, Optional
+
 import numpy as np
-
 from PyQt6 import QtCore, QtGui, QtWidgets
-from PyQt6.QtOpenGLWidgets import QOpenGLWidget
-from OpenGL import GL
 
 
-# ============================================================
-# CAMERA
-# ============================================================
+# -------------------------------------------------------------
+# Core simulation data classes
+# -------------------------------------------------------------
+
+
+def _normalize(v: np.ndarray) -> np.ndarray:
+    n = float(np.linalg.norm(v))
+    if n < 1e-8:
+        return np.zeros_like(v)
+    return (v / n).astype(np.float32)
+
+
+def _normalize_rows(mat: np.ndarray) -> np.ndarray:
+    norms = np.linalg.norm(mat, axis=1, keepdims=True)
+    norms = np.maximum(norms, 1e-8)
+    return (mat / norms).astype(np.float32)
+
+
+def _reflect(v: np.ndarray, normal: np.ndarray) -> np.ndarray:
+    return v - 2.0 * np.dot(v, normal) * normal
+
 
 @dataclass
 class Camera:
-    distance: float = 8.0
-    yaw: float = math.radians(90.0)
+    distance: float = 6.0
+    yaw: float = 0.0
     pitch: float = 0.0
     target: np.ndarray = field(default_factory=lambda: np.zeros(3, dtype=np.float32))
 
@@ -39,24 +49,20 @@ class Camera:
 
     def right(self) -> np.ndarray:
         fwd = self.forward()
-        r = np.cross(self.WORLD_UP, fwd)
+        r = np.cross(fwd, self.WORLD_UP)
         n = float(np.linalg.norm(r)) or 1.0
         return (r / n).astype(np.float32)
 
     def up(self) -> np.ndarray:
-        r = self.right()
         fwd = self.forward()
-        u = np.cross(fwd, r)
+        r = self.right()
+        u = np.cross(r, fwd)
         n = float(np.linalg.norm(u)) or 1.0
         return (u / n).astype(np.float32)
 
     def position(self) -> np.ndarray:
         return self.target - self.forward() * self.distance
 
-
-# ============================================================
-# ORBIT
-# ============================================================
 
 @dataclass
 class OrbitParameters:
@@ -83,17 +89,16 @@ class OrbitSimulator:
         z = self.params.radius * math.sin(self._angle)
         return np.array([x, 0.0, z], dtype=np.float32)
 
+    def set_angle(self, angle: float) -> None:
+        self._angle = angle % (2 * math.pi)
 
-# ============================================================
-# PLANET
-# ============================================================
 
 @dataclass
 class PlanetConfig:
     base_radius: float = 2.0
     height_scale: float = 0.20
-    lat_steps: int = 256
-    lon_steps: int = 512
+    lat_steps: int = 128
+    lon_steps: int = 256
 
 
 class Planet:
@@ -103,8 +108,8 @@ class Planet:
 
     def generate(self, seed: int) -> None:
         rng = np.random.default_rng(seed)
-        lat = np.linspace(-math.pi/2, math.pi/2, self.cfg.lat_steps, dtype=np.float32)
-        lon = np.linspace(0.0, 2*math.pi, self.cfg.lon_steps, endpoint=False, dtype=np.float32)
+        lat = np.linspace(-math.pi / 2, math.pi / 2, self.cfg.lat_steps, dtype=np.float32)
+        lon = np.linspace(0.0, 2 * math.pi, self.cfg.lon_steps, endpoint=False, dtype=np.float32)
         lat_grid, lon_grid = np.meshgrid(lat, lon, indexing="ij")
 
         base = self._fbm(lat_grid, lon_grid, rng)
@@ -117,49 +122,153 @@ class Planet:
         total = np.zeros_like(latg, dtype=np.float32)
         freq, amp = 1.0, 1.0
         norm = 0.0
-
         for _ in range(5):
-            p1 = rng.uniform(0, 2*math.pi)
-            p2 = rng.uniform(0, 2*math.pi)
+            p1 = rng.uniform(0, 2 * math.pi)
+            p2 = rng.uniform(0, 2 * math.pi)
             s = np.sin(latg * freq + p1) * np.cos(long * freq + p2)
             total += (amp * s).astype(np.float32)
             norm += amp
             freq *= 2.0
             amp *= 0.5
-
         total /= max(norm, 1e-6)
         return total
 
     def _craters(self, latg, long, rng):
         out = np.zeros_like(latg, dtype=np.float32)
         count = int(rng.integers(12, 24))
-
         for _ in range(count):
-            cl = float(rng.uniform(-math.pi/2, math.pi/2))
-            co = float(rng.uniform(0, 2*math.pi))
+            cl = float(rng.uniform(-math.pi / 2, math.pi / 2))
+            co = float(rng.uniform(0, 2 * math.pi))
             r = float(rng.uniform(0.05, 0.18))
             d = float(rng.uniform(-0.5, -0.1))
             dist = self._ang_dist(latg, long, cl, co)
-            out = np.minimum(out, (d * np.exp(-(dist*dist)/(2*r*r))).astype(np.float32))
-
+            out = np.minimum(out, (d * np.exp(-(dist * dist) / (2 * r * r))).astype(np.float32))
         return out
 
     def _ang_dist(self, latg, long, cl, co):
         dlat = latg - cl
         dlon = long - co
-        a = (np.sin(dlat*0.5)**2).astype(np.float32) + np.cos(latg)*math.cos(cl)*(np.sin(dlon*0.5)**2)
-        a = np.clip(a, 0.0, 1.0)
+        a = (np.sin(dlat * 0.5) ** 2).astype(np.float32) + np.cos(latg) * math.cos(cl) * (np.sin(dlon * 0.5) ** 2)
+        a = np.clip(a.astype(np.float32), 0.0, 1.0)
         return (2.0 * np.arctan2(np.sqrt(a), np.sqrt(1.0 - a) + 1e-6)).astype(np.float32)
 
 
-# ============================================================
-# MATRIX UTILS
-# ============================================================
+@dataclass
+class Light:
+    direction: np.ndarray
+    intensity: np.ndarray = field(default_factory=lambda: np.array([1.0, 0.98, 0.92], dtype=np.float32))
 
-def mat4_identity():
-    return np.eye(4, dtype=np.float32)
 
-def look_at(eye, center, up):
+@dataclass
+class RenderSettings:
+    width: int = 256
+    height: int = 144
+    fov: float = math.radians(60.0)
+
+
+# -------------------------------------------------------------
+# Geometry helpers
+# -------------------------------------------------------------
+
+
+class PlanetMesh:
+    def __init__(self, planet: Planet):
+        self.planet = planet
+        self.lat_steps = planet.cfg.lat_steps
+        self.lon_steps = planet.cfg.lon_steps
+        self._latitudes = np.linspace(-math.pi / 2, math.pi / 2, self.lat_steps, dtype=np.float32)
+        self._longitudes = np.linspace(0.0, 2 * math.pi, self.lon_steps, endpoint=False, dtype=np.float32)
+        self.indices = self._build_indices()
+        self.positions = np.zeros((self.lat_steps * self.lon_steps, 3), dtype=np.float32)
+        self.normals = np.zeros_like(self.positions)
+        self.altitudes = np.zeros(self.lat_steps * self.lon_steps, dtype=np.float32)
+        self.max_radius = planet.cfg.base_radius
+        self.update()
+
+    def _build_indices(self) -> np.ndarray:
+        idx = []
+        for i in range(self.lat_steps - 1):
+            for j in range(self.lon_steps):
+                i0 = i * self.lon_steps + j
+                i1 = i * self.lon_steps + ((j + 1) % self.lon_steps)
+                i2 = (i + 1) * self.lon_steps + j
+                i3 = (i + 1) * self.lon_steps + ((j + 1) % self.lon_steps)
+                idx.append((i0, i2, i1))
+                idx.append((i2, i3, i1))
+        return np.array(idx, dtype=np.int32)
+
+    def update(self) -> None:
+        cfg = self.planet.cfg
+        heights = self.planet.heights.astype(np.float32)
+        radius = cfg.base_radius + cfg.height_scale * heights
+
+        cos_lat = np.cos(self._latitudes).astype(np.float32)[:, None]
+        sin_lat = np.sin(self._latitudes).astype(np.float32)[:, None]
+        cos_lon = np.cos(self._longitudes).astype(np.float32)[None, :]
+        sin_lon = np.sin(self._longitudes).astype(np.float32)[None, :]
+
+        dir_x = cos_lat * cos_lon
+        dir_y = sin_lat * np.ones_like(cos_lon)
+        dir_z = cos_lat * sin_lon
+
+        x = radius * dir_x
+        y = radius * dir_y
+        z = radius * dir_z
+
+        positions = np.stack([x, y, z], axis=-1)
+        self.positions = positions.reshape(-1, 3).astype(np.float32)
+        self.altitudes = (radius - cfg.base_radius).reshape(-1).astype(np.float32)
+        self.max_radius = float(np.max(radius))
+
+        normals = np.zeros_like(positions, dtype=np.float32)
+        for i in range(self.lat_steps):
+            ip = min(i + 1, self.lat_steps - 1)
+            im = max(i - 1, 0)
+            for j in range(self.lon_steps):
+                jp = (j + 1) % self.lon_steps
+                jm = (j - 1) % self.lon_steps
+                v_lat = positions[ip, j] - positions[im, j]
+                v_lon = positions[i, jp] - positions[i, jm]
+                n = np.cross(v_lon, v_lat)
+                normals[i, j] = _normalize(n)
+        self.normals = normals.reshape(-1, 3).astype(np.float32)
+
+
+class SphereMesh:
+    def __init__(self, radius: float, lat_steps: int = 32, lon_steps: int = 64):
+        self.radius = radius
+        latitudes = np.linspace(-math.pi / 2, math.pi / 2, lat_steps, dtype=np.float32)
+        longitudes = np.linspace(0.0, 2 * math.pi, lon_steps, endpoint=False, dtype=np.float32)
+        cos_lat = np.cos(latitudes).astype(np.float32)[:, None]
+        sin_lat = np.sin(latitudes).astype(np.float32)[:, None]
+        cos_lon = np.cos(longitudes).astype(np.float32)[None, :]
+        sin_lon = np.sin(longitudes).astype(np.float32)[None, :]
+
+        dir_x = cos_lat * cos_lon
+        dir_y = sin_lat * np.ones_like(cos_lon)
+        dir_z = cos_lat * sin_lon
+        directions = np.stack([dir_x, dir_y, dir_z], axis=-1)
+        self.directions = directions.reshape(-1, 3).astype(np.float32)
+        self.vertices = (self.directions * radius).astype(np.float32)
+
+        idx = []
+        for i in range(lat_steps - 1):
+            for j in range(lon_steps):
+                i0 = i * lon_steps + j
+                i1 = i * lon_steps + ((j + 1) % lon_steps)
+                i2 = (i + 1) * lon_steps + j
+                i3 = (i + 1) * lon_steps + ((j + 1) % lon_steps)
+                idx.append((i0, i2, i1))
+                idx.append((i2, i3, i1))
+        self.indices = np.array(idx, dtype=np.int32)
+
+
+# -------------------------------------------------------------
+# Rendering helpers
+# -------------------------------------------------------------
+
+
+def look_at(eye: np.ndarray, center: np.ndarray, up: np.ndarray) -> np.ndarray:
     f = center - eye
     f = f / (np.linalg.norm(f) + 1e-8)
     u = up / (np.linalg.norm(up) + 1e-8)
@@ -171,854 +280,698 @@ def look_at(eye, center, up):
     M[0, :3] = s
     M[1, :3] = u2
     M[2, :3] = -f
-
-    T = np.eye(4, dtype=np.float32)
-    T[:3, 3] = -eye
-
-    return M @ T
-
-def perspective(fov, aspect, near, far):
-    f = 1.0 / math.tan(fov/2)
-    M = np.zeros((4,4), dtype=np.float32)
-    M[0,0] = f/aspect
-    M[1,1] = f
-    M[2,2] = (far+near)/(near-far)
-    M[2,3] = (2*far*near)/(near-far)
-    M[3,2] = -1.0
+    M[0, 3] = -np.dot(s, eye)
+    M[1, 3] = -np.dot(u2, eye)
+    M[2, 3] = np.dot(f, eye)
     return M
 
-def ortho(l, r, b, t, n, f):
-    M = np.eye(4, dtype=np.float32)
-    M[0,0] = 2/(r-l)
-    M[1,1] = 2/(t-b)
-    M[2,2] = -2/(f-n)
-    M[0,3] = -(r+l)/(r-l)
-    M[1,3] = -(t+b)/(t-b)
-    M[2,3] = -(f+n)/(f-n)
+
+def perspective(fov: float, aspect: float, near: float, far: float) -> np.ndarray:
+    f = 1.0 / math.tan(fov / 2.0)
+    M = np.zeros((4, 4), dtype=np.float32)
+    M[0, 0] = f / aspect
+    M[1, 1] = f
+    M[2, 2] = (far + near) / (near - far)
+    M[2, 3] = (2 * far * near) / (near - far)
+    M[3, 2] = -1.0
     return M
 
-def mul(a, b):
-    return (a @ b).astype(np.float32)
+
+def project_points(points: np.ndarray, matrix: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    ones = np.ones((points.shape[0], 1), dtype=np.float32)
+    homo = np.concatenate([points, ones], axis=1)
+    clip = (matrix @ homo.T).T
+    w = clip[:, 3:4]
+    mask = w[:, 0] > 1e-4
+    ndc = np.zeros_like(clip[:, :3])
+    ndc[mask] = clip[mask, :3] / w[mask]
+    return ndc, w[:, 0], mask
 
 
-# ============================================================
-# SPHERE GENERATOR
-# ============================================================
-
-def build_uv_sphere(stacks, slices, radius=1.0):
-    pos = []
-    uv = []
-
-    for i in range(stacks+1):
-        v = i / stacks
-        phi = v * math.pi
-        for j in range(slices+1):
-            u = j / slices
-            theta = u * 2*math.pi
-
-            x = math.sin(phi) * math.cos(theta)
-            y = math.cos(phi)
-            z = math.sin(phi) * math.sin(theta)
-
-            pos += [radius*x, radius*y, radius*z]
-            uv += [u, v]
-
-    pos = np.array(pos, dtype=np.float32)
-    uv = np.array(uv, dtype=np.float32)
-
-    idx = []
-    for i in range(stacks):
-        for j in range(slices):
-            a = i*(slices+1) + j
-            b = a + slices + 1
-            idx += [a, b, a+1, b, b+1, a+1]
-
-    idx = np.array(idx, dtype=np.uint32)
-    return pos, uv, idx
+def _ray_sphere_intersection(origin: np.ndarray, direction: np.ndarray, center: np.ndarray, radius: float) -> bool:
+    oc = origin - center
+    b = np.dot(oc, direction)
+    c = np.dot(oc, oc) - radius * radius
+    disc = b * b - c
+    if disc < 0.0:
+        return False
+    s = math.sqrt(max(disc, 0.0))
+    t = -b - s
+    if t > 1e-4:
+        return True
+    t = -b + s
+    return t > 1e-4
 
 
-# ============================================================
-# GL WIDGET
-# ============================================================
+class StarField:
+    def __init__(self, count: int = 1400, seed: int = 12345):
+        rng = np.random.default_rng(seed)
+        phi = rng.uniform(0.0, 2 * math.pi, count)
+        cos_theta = rng.uniform(-1.0, 1.0, count)
+        sin_theta = np.sqrt(1.0 - np.clip(cos_theta * cos_theta, 0.0, 1.0))
+        self.directions = np.stack([
+            sin_theta * np.cos(phi),
+            cos_theta,
+            sin_theta * np.sin(phi),
+        ], axis=1).astype(np.float32)
+        self.base_intensity = rng.uniform(0.55, 1.0, count).astype(np.float32)
+        self.sizes = rng.uniform(0.6, 2.0, count).astype(np.float32)
+        self.twinkle_freq = rng.uniform(1.5, 4.5, count).astype(np.float32)
+        self.twinkle_phase = rng.uniform(0.0, 2 * math.pi, count).astype(np.float32)
 
-@dataclass
-class RenderSettings:
-    fov: float = math.radians(60)
-    shadow_size: int = 2048
-    near: float = 0.05
-    far: float = 100.0
-    light_dir: np.ndarray = field(default_factory=lambda: np.array([-1.0, 0.3, -0.4], dtype=np.float32))
-    light_intensity: np.ndarray = field(default_factory=lambda: np.array([1.0, 0.98, 0.92], dtype=np.float32))
+    def iter_visible(self, scene_rot: np.ndarray, camera: Camera, settings: RenderSettings, view: np.ndarray,
+                     proj: np.ndarray, time_now: float) -> Iterable[tuple[float, float, float, float]]:
+        vp = proj @ view
+        far_distance = 60.0
+        dirs_world = (scene_rot @ self.directions.T).T
+        points = dirs_world * far_distance
+        ndc, _, mask = project_points(points, vp)
+        width, height = settings.width, settings.height
+        sx = (ndc[:, 0] * 0.5 + 0.5) * width
+        sy = (1.0 - (ndc[:, 1] * 0.5 + 0.5)) * height
+        visible = mask & (ndc[:, 2] < 1.0)
+        brightness = self.base_intensity * (0.6 + 0.4 * np.sin(self.twinkle_phase + time_now * self.twinkle_freq))
+        for x, y, br, sz, ok in zip(sx, sy, brightness, self.sizes, visible):
+            if ok and 0.0 <= x < width and 0.0 <= y < height:
+                yield float(x), float(y), float(max(br, 0.0)), float(sz)
 
 
-class GLMeshWidget(QOpenGLWidget):
+# -------------------------------------------------------------
+# Main rendering widget
+# -------------------------------------------------------------
 
-    def __init__(self, planet, orbit, camera, settings, parent=None):
+
+class SoftwareRendererWidget(QtWidgets.QWidget):
+    frame_ready = QtCore.pyqtSignal(object)
+
+    def __init__(
+        self,
+        planet: Planet,
+        orbit: OrbitSimulator,
+        light: Light,
+        camera: Camera,
+        settings: RenderSettings,
+        parent: Optional[QtWidgets.QWidget] = None,
+    ) -> None:
         super().__init__(parent)
-        self.setMinimumSize(960, 540)
-
+        self.setMinimumSize(640, 360)
         self.planet = planet
         self.orbit = orbit
+        self.light = light
         self.camera = camera
         self.settings = settings
 
-        self._last = time.time()
-        self._t0 = time.time()
+        self.planet_mesh = PlanetMesh(planet)
+        self.satellite_mesh = SphereMesh(radius=0.35, lat_steps=24, lon_steps=48)
+        self.star_field = StarField()
 
-        t = QtCore.QTimer(self)
-        t.timeout.connect(self.update)
-        t.start(16)
+        self._scene_rot = np.identity(3, dtype=np.float32)
+        self._scene_trans = np.zeros(3, dtype=np.float32)
 
-        self._prog_sky = None
-        self._prog_depth = None
-        self._prog_lit = None
-        self._prog_axes = None
+        self._timer = QtCore.QTimer(self)
+        self._timer.timeout.connect(self.update)
+        self._timer.start(16)
+        self._last_time = time.time()
+        self._start_time = self._last_time
+        self._record_callback: Optional[Callable[[np.ndarray], None]] = None
 
-    # ============================================================
-    # INITIALIZE GL
-    # ============================================================
+    def rotate_scene_euler_deg(self, dx: float, dy: float, dz: float) -> None:
+        def Rx(a: float) -> np.ndarray:
+            c, s = math.cos(a), math.sin(a)
+            return np.array([[1, 0, 0], [0, c, -s], [0, s, c]], dtype=np.float32)
 
-    def initializeGL(self):
-        print("GL_VERSION =", GL.glGetString(GL.GL_VERSION))
-        print("GL_VENDOR  =", GL.glGetString(GL.GL_VENDOR))
-        print("GL_RENDERER=", GL.glGetString(GL.GL_RENDERER))
+        def Ry(a: float) -> np.ndarray:
+            c, s = math.cos(a), math.sin(a)
+            return np.array([[c, 0, s], [0, 1, 0], [-s, 0, c]], dtype=np.float32)
 
-        GL.glEnable(GL.GL_DEPTH_TEST)
-        GL.glEnable(GL.GL_CULL_FACE)
-        GL.glCullFace(GL.GL_BACK)
+        def Rz(a: float) -> np.ndarray:
+            c, s = math.cos(a), math.sin(a)
+            return np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]], dtype=np.float32)
 
-        # compile shaders
-        self._prog_sky = self._build_program(VS_SCREEN, FS_SKY)
-        self._prog_depth = self._build_program(VS_DEPTH, FS_DEPTH)
-        self._prog_lit = self._build_program(VS_LIT, FS_LIT)
-        self._prog_axes = self._build_program(VS_SCREEN, FS_AXES)
+        R = Rz(math.radians(dz)) @ Ry(math.radians(dy)) @ Rx(math.radians(dx))
+        self._scene_rot = (R @ self._scene_rot).astype(np.float32)
+        self.update()
 
-        # fullscreen quad
-        self._vao_quad = GL.glGenVertexArrays(1)
-        GL.glBindVertexArray(self._vao_quad)
-        vbo = GL.glGenBuffers(1)
-        GL.glBindBuffer(GL.GL_ARRAY_BUFFER, vbo)
+    def translate_scene(self, dx: float, dy: float, dz: float) -> None:
+        self._scene_trans += np.array([dx, dy, dz], dtype=np.float32)
+        self.update()
 
-        quad = np.array([
-            -1, -1, 0, 0,
-             1, -1, 1, 0,
-            -1,  1, 0, 1,
-             1,  1, 1, 1
-        ], dtype=np.float32)
+    def update_planet_mesh(self) -> None:
+        self.planet_mesh.update()
+        self.update()
 
-        GL.glBufferData(GL.GL_ARRAY_BUFFER, quad.nbytes, quad, GL.GL_STATIC_DRAW)
-        GL.glEnableVertexAttribArray(0); GL.glVertexAttribPointer(0, 2, GL.GL_FLOAT, False, 16, ctypes.c_void_p(0))
-        GL.glEnableVertexAttribArray(1); GL.glVertexAttribPointer(1, 2, GL.GL_FLOAT, False, 16, ctypes.c_void_p(8))
+    def set_record_callback(self, fn: Optional[Callable[[np.ndarray], None]]) -> None:
+        self._record_callback = fn
 
-        # planet sphere
-        p_pos, p_uv, p_idx = build_uv_sphere(160, 320, 1.0)
-        self._vao_planet, _, _ = self._build_mesh(p_pos, p_uv, p_idx)
-        self._planet_index_count = p_idx.size
+    def sizeHint(self) -> QtCore.QSize:
+        return QtCore.QSize(960, 540)
 
-        # satellite sphere
-        s_pos, s_uv, s_idx = build_uv_sphere(64, 128, 0.35)
-        self._vao_sat, _, _ = self._build_mesh(s_pos, s_uv, s_idx)
-        self._sat_index_count = s_idx.size
-
-        # height texture
-        self._planet_height_tex = GL.glGenTextures(1)
-        GL.glBindTexture(GL.GL_TEXTURE_2D, self._planet_height_tex)
-        GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MIN_FILTER, GL.GL_LINEAR)
-        GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MAG_FILTER, GL.GL_LINEAR)
-        GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_WRAP_S, GL.GL_REPEAT)
-        GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_WRAP_T, GL.GL_CLAMP_TO_EDGE)
-        self._upload_height()
-
-        # shadow map
-        self._shadow_tex = GL.glGenTextures(1)
-        GL.glBindTexture(GL.GL_TEXTURE_2D, self._shadow_tex)
-        size = self.settings.shadow_size
-        GL.glTexImage2D(GL.GL_TEXTURE_2D, 0, GL.GL_DEPTH_COMPONENT24, size, size, 0,
-                        GL.GL_DEPTH_COMPONENT, GL.GL_UNSIGNED_INT, None)
-        GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MIN_FILTER, GL.GL_LINEAR)
-        GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_MAG_FILTER, GL.GL_LINEAR)
-        GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_WRAP_S, GL.GL_CLAMP_TO_EDGE)
-        GL.glTexParameteri(GL.GL_TEXTURE_2D, GL.GL_TEXTURE_WRAP_T, GL.GL_CLAMP_TO_EDGE)
-
-        self._shadow_fbo = GL.glGenFramebuffers(1)
-        GL.glBindFramebuffer(GL.GL_FRAMEBUFFER, self._shadow_fbo)
-        GL.glFramebufferTexture2D(GL.GL_FRAMEBUFFER, GL.GL_DEPTH_ATTACHMENT,
-                                  GL.GL_TEXTURE_2D, self._shadow_tex, 0)
-        GL.glDrawBuffer(GL.GL_NONE)
-        GL.glReadBuffer(GL.GL_NONE)
-        GL.glBindFramebuffer(GL.GL_FRAMEBUFFER, 0)
-
-    # ============================================================
-    # HELPER MESH + PROGRAM BUILDERS
-    # ============================================================
-
-    def _build_mesh(self, pos, uv, idx):
-        vao = GL.glGenVertexArrays(1)
-        GL.glBindVertexArray(vao)
-
-        vbo = GL.glGenBuffers(1)
-        GL.glBindBuffer(GL.GL_ARRAY_BUFFER, vbo)
-
-        inter = np.concatenate([pos.reshape(-1,3),
-                                uv.reshape(-1,2)], axis=1).astype(np.float32).ravel()
-
-        GL.glBufferData(GL.GL_ARRAY_BUFFER, inter.nbytes, inter, GL.GL_STATIC_DRAW)
-        GL.glEnableVertexAttribArray(0); GL.glVertexAttribPointer(0, 3, GL.GL_FLOAT, False, 20, ctypes.c_void_p(0))
-        GL.glEnableVertexAttribArray(1); GL.glVertexAttribPointer(1, 2, GL.GL_FLOAT, False, 20, ctypes.c_void_p(12))
-
-        ebo = GL.glGenBuffers(1)
-        GL.glBindBuffer(GL.GL_ELEMENT_ARRAY_BUFFER, ebo)
-        GL.glBufferData(GL.GL_ELEMENT_ARRAY_BUFFER, idx.nbytes, idx, GL.GL_STATIC_DRAW)
-
-        return vao, vbo, ebo
-
-    def _compile(self, kind, src):
-        s = GL.glCreateShader(kind)
-        GL.glShaderSource(s, src)
-        GL.glCompileShader(s)
-
-        if GL.glGetShaderiv(s, GL.GL_COMPILE_STATUS) != GL.GL_TRUE:
-            raise RuntimeError(GL.glGetShaderInfoLog(s).decode())
-
-        return s
-
-    def _build_program(self, vs, fs):
-        v = self._compile(GL.GL_VERTEX_SHADER, vs)
-        f = self._compile(GL.GL_FRAGMENT_SHADER, fs)
-        p = GL.glCreateProgram()
-        GL.glAttachShader(p, v)
-        GL.glAttachShader(p, f)
-        GL.glLinkProgram(p)
-
-        if GL.glGetProgramiv(p, GL.GL_LINK_STATUS) != GL.GL_TRUE:
-            raise RuntimeError(GL.glGetProgramInfoLog(p).decode())
-
-        GL.glDeleteShader(v)
-        GL.glDeleteShader(f)
-        return p
-
-    def _upload_height(self):
-        h = self.planet.heights.astype(np.float32)
-        h01 = np.clip(h * 0.5 + 0.5, 0.0, 1.0)
-        data = (h01 * 255).astype(np.uint8)
-
-        GL.glBindTexture(GL.GL_TEXTURE_2D, self._planet_height_tex)
-        GL.glPixelStorei(GL.GL_UNPACK_ALIGNMENT, 1)
-        GL.glTexImage2D(GL.GL_TEXTURE_2D, 0, GL.GL_R8,
-                        data.shape[1], data.shape[0], 0,
-                        GL.GL_RED, GL.GL_UNSIGNED_BYTE, data)
-
-    # ============================================================
-    # RENDER FRAME
-    # ============================================================
-
-    def paintGL(self):
+    def paintEvent(self, event: QtGui.QPaintEvent) -> None:
         now = time.time()
-        dt = min(max(now - self._last, 0.0), 0.05)
-        self._last = now
+        dt = min(max(now - self._last_time, 0.0), 0.050)
+        self._last_time = now
         self.orbit.update(dt)
 
-        pr = max(1.0, float(self.devicePixelRatioF()))
-        w = max(1, int(self.width() * pr))
-        h = max(1, int(self.height() * pr))
+        image = self._render(now)
 
-        # compute matrices
-        eye = self.camera.position()
-        center = self.camera.target
-        up = self.camera.up()
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.RenderHint.SmoothPixmapTransform, True)
+        target_rect = self.rect()
+        painter.drawImage(target_rect, image)
+        painter.end()
 
-        V = look_at(eye, center, up)
-        P = perspective(self.settings.fov, w/h, 0.05, 100.0)
-        VP = mul(P, V)
+        if self._record_callback is not None:
+            img_rgb = image.convertToFormat(QtGui.QImage.Format.Format_RGB888)
+            ptr = img_rgb.bits()
+            ptr.setsize(img_rgb.height() * img_rgb.bytesPerLine())
+            arr = np.frombuffer(ptr, np.uint8).reshape(img_rgb.height(), img_rgb.width(), 3).copy()
+            self._record_callback(arr)
 
-        # shadow matrices
-        light_dir = self.settings.light_dir / (np.linalg.norm(self.settings.light_dir)+1e-8)
+    # ---------------------------------------------------------
+    # Rendering pipeline
+    # ---------------------------------------------------------
 
-        L_view = look_at(-light_dir*8, np.array([0,0,0], np.float32), np.array([0,1,0], np.float32))
-        L_proj = ortho(-10, 10, -10, 10, 0.1, 30)
-        LVP = mul(L_proj, L_view)
+    def _render(self, now: float) -> QtGui.QImage:
+        width, height = self.settings.width, self.settings.height
+        image = QtGui.QImage(width, height, QtGui.QImage.Format.Format_RGB32)
+        image.fill(QtGui.QColor(0, 0, 0))
+        painter = QtGui.QPainter(image)
+        painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, True)
 
-        sat_center = self.orbit.position()
+        camera_pos = self.camera.position().astype(np.float32)
+        view = look_at(camera_pos, self.camera.target.astype(np.float32), self.camera.up())
+        aspect = float(width) / max(float(height), 1.0)
+        proj = perspective(self.settings.fov, aspect, 0.1, 120.0)
+        vp = proj @ view
 
-        # ======================================================
-        # 1) SKY
-        # ======================================================
-        GL.glViewport(0, 0, w, h)
-        GL.glDisable(GL.GL_DEPTH_TEST)
+        self._draw_sky(painter, now, view, proj, width, height)
+        planet_center_world = self._scene_rot @ np.zeros(3, dtype=np.float32) + self._scene_trans
+        sat_center_local = self.orbit.position().astype(np.float32)
+        sat_center_world = (self._scene_rot @ sat_center_local) + self._scene_trans
 
-        GL.glUseProgram(self._prog_sky)
-        self._set1f(self._prog_sky, "uTime", now - self._t0)
-        self._set2f(self._prog_sky, "uResolution", float(w), float(h))
-        self._set3f(self._prog_sky, "uCamFwd", *self.camera.forward())
-        self._set3f(self._prog_sky, "uCamRight", *self.camera.right())
-        self._set3f(self._prog_sky, "uCamUp", *self.camera.up())
+        self._draw_planet(painter, vp, camera_pos, sat_center_world)
+        self._draw_satellite(painter, vp, camera_pos, sat_center_world, planet_center_world)
+        self._draw_axes(painter, width, height)
 
-        GL.glBindVertexArray(self._vao_quad)
-        GL.glDrawArrays(GL.GL_TRIANGLE_STRIP, 0, 4)
+        painter.end()
+        return image
 
-        # ======================================================
-        # 2) SHADOW MAP
-        # ======================================================
-        GL.glViewport(0, 0, self.settings.shadow_size, self.settings.shadow_size)
-        GL.glBindFramebuffer(GL.GL_FRAMEBUFFER, self._shadow_fbo)
-        GL.glClear(GL.GL_DEPTH_BUFFER_BIT)
-        GL.glEnable(GL.GL_DEPTH_TEST)
-        GL.glColorMask(GL.GL_FALSE, GL.GL_FALSE, GL.GL_FALSE, GL.GL_FALSE)
+    def _draw_sky(self, painter: QtGui.QPainter, now: float, view: np.ndarray, proj: np.ndarray, width: int, height: int) -> None:
+        gradient = QtGui.QLinearGradient(0, 0, 0, height)
+        gradient.setColorAt(0.0, QtGui.QColor(0, 3, 8))
+        gradient.setColorAt(1.0, QtGui.QColor(0, 0, 2))
+        painter.fillRect(0, 0, width, height, gradient)
 
-        GL.glUseProgram(self._prog_depth)
+        painter.setPen(QtCore.Qt.PenStyle.NoPen)
+        painter.setBrush(QtGui.QBrush(QtGui.QColor(255, 255, 255)))
+        for x, y, intensity, size in self.star_field.iter_visible(self._scene_rot, self.camera, self.settings, view, proj, now - self._start_time):
+            alpha = int(np.clip(intensity * 255.0, 30, 255))
+            radius = size * 0.5
+            color = QtGui.QColor(215, 225, 255, alpha)
+            painter.setBrush(QtGui.QBrush(color))
+            painter.drawEllipse(QtCore.QPointF(x, y), radius, radius)
 
-        GL.glActiveTexture(GL.GL_TEXTURE0)
-        GL.glBindTexture(GL.GL_TEXTURE_2D, self._planet_height_tex)
-        self._seti(self._prog_depth, "uHeightTex", 0)
+    def _draw_planet(self, painter: QtGui.QPainter, vp: np.ndarray, camera_pos: np.ndarray, sat_center_world: np.ndarray) -> None:
+        positions_model = self.planet_mesh.positions
+        normals_model = self.planet_mesh.normals
+        altitudes = self.planet_mesh.altitudes
+        rot = self._scene_rot
+        trans = self._scene_trans
 
-        # planet
-        self._set1f(self._prog_depth, "uBaseRadius", 2.0)
-        self._set1f(self._prog_depth, "uHeightScale", 0.20)
-        self._setMat4(self._prog_depth, "uM", mat4_identity())
-        self._setMat4(self._prog_depth, "uVP", LVP)
+        positions_world = (rot @ positions_model.T).T + trans
+        normals_world = _normalize_rows((rot @ normals_model.T).T)
 
-        GL.glBindVertexArray(self._vao_planet)
-        GL.glDrawElements(GL.GL_TRIANGLES, self._planet_index_count, GL.GL_UNSIGNED_INT, None)
+        ndc, _, mask = project_points(positions_world, vp)
+        sx = (ndc[:, 0] * 0.5 + 0.5) * self.settings.width
+        sy = (1.0 - (ndc[:, 1] * 0.5 + 0.5)) * self.settings.height
+        depth = ndc[:, 2]
 
-        # satellite
-        M_sat = mat4_identity()
-        M_sat[:3,3] = sat_center
+        triangles = []
+        cam = camera_pos.astype(np.float32)
+        light_dir = _normalize(-self.light.direction.astype(np.float32))
+        for tri in self.planet_mesh.indices:
+            if not (mask[tri[0]] and mask[tri[1]] and mask[tri[2]]):
+                continue
+            pts = np.array([
+                [sx[tri[0]], sy[tri[0]]],
+                [sx[tri[1]], sy[tri[1]]],
+                [sx[tri[2]], sy[tri[2]]],
+            ], dtype=np.float32)
+            if np.any(np.isnan(pts)):
+                continue
+            world_pts = positions_world[tri]
+            normal = _normalize(np.mean(normals_world[tri], axis=0))
+            centroid = np.mean(world_pts, axis=0)
+            view_dir = _normalize(cam - centroid)
+            if np.dot(normal, view_dir) <= 0.0:
+                continue
+            altitude = float(np.mean(altitudes[tri]))
+            color = self._shade_planet(centroid, normal, altitude, cam, light_dir, sat_center_world)
+            avg_depth = float(np.mean(depth[tri]))
+            triangles.append((avg_depth, pts, color))
 
-        self._setMat4(self._prog_depth, "uM", M_sat)
-        self._set1f(self._prog_depth, "uBaseRadius", 0.0)
-        self._set1f(self._prog_depth, "uHeightScale", 0.0)
+        triangles.sort(key=lambda item: item[0], reverse=True)
+        painter.setPen(QtCore.Qt.PenStyle.NoPen)
+        for _, pts, color in triangles:
+            qcolor = QtGui.QColor()
+            qcolor.setRgbF(color[0], color[1], color[2])
+            painter.setBrush(QtGui.QBrush(qcolor))
+            path = QtGui.QPainterPath()
+            path.moveTo(float(pts[0, 0]), float(pts[0, 1]))
+            path.lineTo(float(pts[1, 0]), float(pts[1, 1]))
+            path.lineTo(float(pts[2, 0]), float(pts[2, 1]))
+            path.closeSubpath()
+            painter.drawPath(path)
 
-        GL.glBindVertexArray(self._vao_sat)
-        GL.glDrawElements(GL.GL_TRIANGLES, self._sat_index_count, GL.GL_UNSIGNED_INT, None)
+    def _draw_satellite(self, painter: QtGui.QPainter, vp: np.ndarray, camera_pos: np.ndarray, sat_center_world: np.ndarray,
+                        planet_center_world: np.ndarray) -> None:
+        mesh = self.satellite_mesh
+        rot = self._scene_rot
+        cam = camera_pos.astype(np.float32)
+        positions_world = (rot @ mesh.vertices.T).T + sat_center_world
+        normals_world = _normalize_rows((rot @ mesh.directions.T).T)
 
-        GL.glBindFramebuffer(GL.GL_FRAMEBUFFER, 0)
-        GL.glColorMask(GL.GL_TRUE, GL.GL_TRUE, GL.GL_TRUE, GL.GL_TRUE)
+        ndc, _, mask = project_points(positions_world, vp)
+        sx = (ndc[:, 0] * 0.5 + 0.5) * self.settings.width
+        sy = (1.0 - (ndc[:, 1] * 0.5 + 0.5)) * self.settings.height
+        depth = ndc[:, 2]
 
-        # ======================================================
-        # 3) LIT PASS
-        # ======================================================
-        GL.glViewport(0, 0, w, h)
-        GL.glEnable(GL.GL_DEPTH_TEST)
-        GL.glClear(GL.GL_DEPTH_BUFFER_BIT)
+        light_dir = _normalize(-self.light.direction.astype(np.float32))
+        triangles = []
+        for tri in mesh.indices:
+            if not (mask[tri[0]] and mask[tri[1]] and mask[tri[2]]):
+                continue
+            pts = np.array([
+                [sx[tri[0]], sy[tri[0]]],
+                [sx[tri[1]], sy[tri[1]]],
+                [sx[tri[2]], sy[tri[2]]],
+            ], dtype=np.float32)
+            if np.any(np.isnan(pts)):
+                continue
+            world_pts = positions_world[tri]
+            normal = _normalize(np.mean(normals_world[tri], axis=0))
+            centroid = np.mean(world_pts, axis=0)
+            view_dir = _normalize(cam - centroid)
+            if np.dot(normal, view_dir) <= 0.0:
+                continue
+            color = self._shade_satellite(centroid, normal, view_dir, light_dir, planet_center_world)
+            avg_depth = float(np.mean(depth[tri]))
+            triangles.append((avg_depth, pts, color))
 
-        GL.glUseProgram(self._prog_lit)
+        triangles.sort(key=lambda item: item[0], reverse=True)
+        painter.setPen(QtCore.Qt.PenStyle.NoPen)
+        for _, pts, color in triangles:
+            qcolor = QtGui.QColor()
+            qcolor.setRgbF(color[0], color[1], color[2])
+            painter.setBrush(QtGui.QBrush(qcolor))
+            path = QtGui.QPainterPath()
+            path.moveTo(float(pts[0, 0]), float(pts[0, 1]))
+            path.lineTo(float(pts[1, 0]), float(pts[1, 1]))
+            path.lineTo(float(pts[2, 0]), float(pts[2, 1]))
+            path.closeSubpath()
+            painter.drawPath(path)
 
-        self._setMat4(self._prog_lit, "uVP", VP)
-        self._setMat4(self._prog_lit, "uLVP", LVP)
+    def _shade_planet(
+        self,
+        position: np.ndarray,
+        normal: np.ndarray,
+        altitude: float,
+        camera_pos: np.ndarray,
+        light_dir: np.ndarray,
+        sat_center_world: np.ndarray,
+    ) -> np.ndarray:
+        ambient = 0.08
+        base = np.array([0.22, 0.65, 0.28], dtype=np.float32)
+        sky = np.array([0.96, 0.96, 0.98], dtype=np.float32)
 
-        self._set3f(self._prog_lit, "uLightDir", *light_dir)
-        self._set3f(self._prog_lit, "uLightI", *self.settings.light_intensity)
-        self._set3f(self._prog_lit, "uCamPos", *eye)
+        diffuse = 0.0
+        specular = 0.0
+        n_dot_l = float(np.dot(normal, light_dir))
+        shadow = False
+        if n_dot_l > 0.0:
+            shadow = self._shadowed_by_satellite(position, light_dir, sat_center_world)
+        if n_dot_l > 0.0 and not shadow:
+            diffuse = max(n_dot_l, 0.0)
+            reflect_dir = _reflect(-light_dir, normal)
+            specular = pow(max(np.dot(reflect_dir, _normalize(camera_pos - position)), 0.0), 32.0)
+        color = base * (ambient + diffuse) + 0.22 * specular
+        color *= self.light.intensity.astype(np.float32)
+        haze = np.clip(altitude / (self.planet.cfg.base_radius * 0.6), 0.0, 1.0)
+        color = color * (1.0 - 0.10 * haze) + sky * (0.06 * haze)
+        color = np.clip(color, 0.0, 1.0)
+        color = np.power(color, 1.0 / 2.2)
+        return color
 
-        GL.glActiveTexture(GL.GL_TEXTURE1)
-        GL.glBindTexture(GL.GL_TEXTURE_2D, self._shadow_tex)
-        self._seti(self._prog_lit, "uShadowMap", 1)
+    def _shade_satellite(
+        self,
+        position: np.ndarray,
+        normal: np.ndarray,
+        view_dir: np.ndarray,
+        light_dir: np.ndarray,
+        planet_center_world: np.ndarray,
+    ) -> np.ndarray:
+        base = np.array([0.85, 0.85, 0.90], dtype=np.float32)
+        diffuse = 0.0
+        specular = 0.0
+        shadow = self._shadowed_by_planet(position, light_dir, planet_center_world)
+        n_dot_l = float(np.dot(normal, light_dir))
+        if n_dot_l > 0.0 and not shadow:
+            diffuse = max(n_dot_l, 0.0)
+            reflect_dir = _reflect(-light_dir, normal)
+            specular = pow(max(np.dot(reflect_dir, view_dir), 0.0), 64.0)
+        rim = pow(max(1.0 - max(np.dot(normal, view_dir), 0.0), 0.0), 3.0) * 0.12
+        color = base * (0.08 + diffuse) + 0.4 * specular + rim
+        color *= self.light.intensity.astype(np.float32)
+        color = np.clip(color, 0.0, 1.0)
+        color = np.power(color, 1.0 / 2.2)
+        return color
 
-        # planet
-        GL.glActiveTexture(GL.GL_TEXTURE0)
-        GL.glBindTexture(GL.GL_TEXTURE_2D, self._planet_height_tex)
-        self._seti(self._prog_lit, "uHeightTex", 0)
-        self._set1f(self._prog_lit, "uBaseRadius", 2.0)
-        self._set1f(self._prog_lit, "uHeightScale", 0.20)
-        self._set1f(self._prog_lit, "uIsSatellite", 0.0)
-        self._set3f(self._prog_lit, "uBaseColor", 0.22,0.65,0.28)
-        self._set1f(self._prog_lit, "uShininess", 32.0)
-        self._setMat4(self._prog_lit, "uM", mat4_identity())
+    def _shadowed_by_satellite(self, point: np.ndarray, light_dir: np.ndarray, sat_center_world: np.ndarray) -> bool:
+        to_sat = sat_center_world - point
+        proj_len = float(np.dot(to_sat, light_dir))
+        if proj_len <= 0.0:
+            return False
+        closest = to_sat - proj_len * light_dir
+        dist_sq = float(np.dot(closest, closest))
+        return dist_sq < (self.satellite_mesh.radius ** 2)
 
-        GL.glBindVertexArray(self._vao_planet)
-        GL.glDrawElements(GL.GL_TRIANGLES, self._planet_index_count, GL.GL_UNSIGNED_INT, None)
+    def _shadowed_by_planet(self, point: np.ndarray, light_dir: np.ndarray, planet_center_world: np.ndarray) -> bool:
+        offset = point + light_dir * 0.05
+        radius = max(self.planet_mesh.max_radius, self.planet.cfg.base_radius)
+        return _ray_sphere_intersection(offset, light_dir, planet_center_world, radius)
 
-        # satellite
-        self._set1f(self._prog_lit, "uIsSatellite", 1.0)
-        self._set1f(self._prog_lit, "uBaseRadius", 0.0)
-        self._set1f(self._prog_lit, "uHeightScale", 0.0)
-        self._set3f(self._prog_lit, "uBaseColor", 0.9,0.9,1.0)
-        self._set1f(self._prog_lit, "uShininess", 64.0)
-        self._setMat4(self._prog_lit, "uM", M_sat)
+    def _draw_axes(self, painter: QtGui.QPainter, width: int, height: int) -> None:
+        base = np.array([width * 0.10, height * 0.84], dtype=np.float32)
+        length = width * 0.12
+        axes = [
+            (self._scene_rot @ np.array([1.0, 0.0, 0.0], dtype=np.float32), QtGui.QColor(255, 60, 60)),
+            (self._scene_rot @ np.array([0.0, 1.0, 0.0], dtype=np.float32), QtGui.QColor(60, 255, 60)),
+            (self._scene_rot @ np.array([0.0, 0.0, 1.0], dtype=np.float32), QtGui.QColor(80, 130, 255)),
+        ]
+        cam_right = self.camera.right().astype(np.float32)
+        cam_up = self.camera.up().astype(np.float32)
 
-        GL.glBindVertexArray(self._vao_sat)
-        GL.glDrawElements(GL.GL_TRIANGLES, self._sat_index_count, GL.GL_UNSIGNED_INT, None)
-
-        # ======================================================
-        # 4) AXES
-        # ======================================================
-        GL.glDisable(GL.GL_DEPTH_TEST)
-        GL.glEnable(GL.GL_BLEND)
-        GL.glBlendFunc(GL.GL_ONE, GL.GL_ONE)
-
-        GL.glUseProgram(self._prog_axes)
-        self._set2f(self._prog_axes, "uResolution", float(w), float(h))
-        self._set3f(self._prog_axes, "uCamRight", *self.camera.right())
-        self._set3f(self._prog_axes, "uCamUp", *self.camera.up())
-        self._set3f(self._prog_axes, "uWorldX", 1,0,0)
-        self._set3f(self._prog_axes, "uWorldY", 0,1,0)
-        self._set3f(self._prog_axes, "uWorldZ", 0,0,1)
-
-        GL.glBindVertexArray(self._vao_quad)
-        GL.glDrawArrays(GL.GL_TRIANGLE_STRIP, 0, 4)
-
-        GL.glDisable(GL.GL_BLEND)
-
-    # ============================================================
-    # UNIFORM HELPERS
-    # ============================================================
-
-    def _loc(self, prog, name):
-        return GL.glGetUniformLocation(prog, name)
-
-    def _seti(self, prog, name, v):
-        GL.glUniform1i(self._loc(prog, name), int(v))
-
-    def _set1f(self, prog, name, v):
-        GL.glUniform1f(self._loc(prog, name), float(v))
-
-    def _set2f(self, prog, name, x, y):
-        GL.glUniform2f(self._loc(prog, name), float(x), float(y))
-
-    def _set3f(self, prog, name, x, y=None, z=None):
-        if y is None:
-            GL.glUniform3f(self._loc(prog,name), x[0], x[1], x[2])
-        else:
-            GL.glUniform3f(self._loc(prog,name), float(x), float(y), float(z))
-
-    def _setMat4(self, prog, name, M):
-        GL.glUniformMatrix4fv(self._loc(prog, name), 1, GL.GL_FALSE, M.astype(np.float32))
+        for direction, color in axes:
+            dir2d = np.array([
+                np.dot(direction, cam_right),
+                np.dot(direction, cam_up),
+            ], dtype=np.float32)
+            n = float(np.linalg.norm(dir2d))
+            if n < 1e-4:
+                continue
+            d = dir2d / n
+            tip = base + np.array([d[0], -d[1]]) * length
+            pen = QtGui.QPen(color, 2)
+            painter.setPen(pen)
+            painter.drawLine(QtCore.QPointF(base[0], base[1]), QtCore.QPointF(tip[0], tip[1]))
+            arrow = length * 0.18
+            perp = np.array([-d[1], d[0]])
+            p1 = tip - np.array([d[0], -d[1]]) * arrow + perp * (arrow * 0.6)
+            p2 = tip - np.array([d[0], -d[1]]) * arrow - perp * (arrow * 0.6)
+            painter.drawLine(QtCore.QPointF(tip[0], tip[1]), QtCore.QPointF(p1[0], p1[1]))
+            painter.drawLine(QtCore.QPointF(tip[0], tip[1]), QtCore.QPointF(p2[0], p2[1]))
 
 
-# ============================================================
-# CONTROL PANEL UI
-# ============================================================
+# -------------------------------------------------------------
+# UI components
+# -------------------------------------------------------------
+
 
 @dataclass
 class UiState:
     seed: int = 1
+    recording: bool = False
+    frame_index: int = 0
+
+
+class RenderWidget(QtWidgets.QWidget):
+    def __init__(self, renderer: SoftwareRendererWidget, parent: Optional[QtWidgets.QWidget] = None):
+        super().__init__(parent)
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(renderer)
 
 
 class ControlPanel(QtWidgets.QWidget):
     parameters_changed = QtCore.pyqtSignal()
     seed_changed = QtCore.pyqtSignal(int)
+    scene_rotated = QtCore.pyqtSignal(float, float, float)
+    scene_translated = QtCore.pyqtSignal(float, float, float)
+    record_toggled = QtCore.pyqtSignal(bool)
 
     def __init__(self):
         super().__init__()
-        v = QtWidgets.QVBoxLayout(self)
+        self._init_palette()
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.addWidget(self._create_translation_group())
+        layout.addWidget(self._create_rotation_group())
+        layout.addWidget(self._create_scaling_group())
+        layout.addWidget(self._create_orbit_group())
+        layout.addStretch(1)
 
-        v.addWidget(self._orbit_group())
-        v.addWidget(self._camera_group())
-        v.addWidget(self._seed_group())
-        v.addStretch(1)
+    def _init_palette(self) -> None:
+        palette = self.palette()
+        palette.setColor(QtGui.QPalette.ColorRole.Window, QtGui.QColor("#f4f5fb"))
+        palette.setColor(QtGui.QPalette.ColorRole.Base, QtGui.QColor("#ffffff"))
+        palette.setColor(QtGui.QPalette.ColorRole.Button, QtGui.QColor("#e2e6f2"))
+        self.setAutoFillBackground(True)
+        self.setPalette(palette)
+        self.setStyleSheet(
+            "QGroupBox {"
+            "  background-color: #ffffff;"
+            "  border: 1px solid #cfd5e4;"
+            "  border-radius: 8px;"
+            "  margin-top: 12px;"
+            "  padding: 12px;"
+            "}"
+            "QGroupBox::title {"
+            "  subcontrol-origin: margin;"
+            "  left: 12px;"
+            "  padding: 0 4px;"
+            "  color: #3a3f58;"
+            "  font-weight: 600;"
+            "}"
+            "QPushButton {"
+            "  background-color: #d8def0;"
+            "  border: 1px solid #bcc6dd;"
+            "  border-radius: 6px;"
+            "  padding: 6px 10px;"
+            "  font-weight: 500;"
+            "}"
+            "QPushButton:hover {"
+            "  background-color: #cdd6ec;"
+            "}"
+        )
 
-    def _spin(self, value=0.0, minimum=-10.0, maximum=10.0, step=0.1):
+    def _spin(self, value=0.0, minimum=-10.0, maximum=10.0, step=0.1) -> QtWidgets.QDoubleSpinBox:
         box = QtWidgets.QDoubleSpinBox()
         box.setRange(minimum, maximum)
-        box.setDecimals(3)
+        box.setDecimals(2)
         box.setSingleStep(step)
         box.setValue(value)
         return box
 
-    def _orbit_group(self):
-        g = QtWidgets.QGroupBox("Орбита")
-        grid = QtWidgets.QGridLayout(g)
+    def _create_translation_group(self) -> QtWidgets.QGroupBox:
+        group = QtWidgets.QGroupBox("Перенос сцены")
+        form = QtWidgets.QGridLayout(group)
+        self.dx, self.dy, self.dz = [self._spin() for _ in range(3)]
+        form.addWidget(QtWidgets.QLabel("dX"), 0, 0)
+        form.addWidget(self.dx, 0, 1)
+        form.addWidget(QtWidgets.QLabel("dY"), 1, 0)
+        form.addWidget(self.dy, 1, 1)
+        form.addWidget(QtWidgets.QLabel("dZ"), 2, 0)
+        form.addWidget(self.dz, 2, 1)
+        btn = QtWidgets.QPushButton("Перенести")
+        btn.clicked.connect(self._emit_translate)
+        form.addWidget(btn, 3, 0, 1, 2)
+        return group
 
-        self.orbit_radius = self._spin(4.0, 1.2, 16.0, 0.1)
-        self.orbit_speed  = self._spin(1.2, 0.0, 10.0, 0.1)
+    def _emit_translate(self) -> None:
+        self.scene_translated.emit(self.dx.value(), self.dy.value(), self.dz.value())
+        self.dx.setValue(0.0)
+        self.dy.setValue(0.0)
+        self.dz.setValue(0.0)
 
-        apply = QtWidgets.QPushButton("Применить")
-        apply.clicked.connect(self.parameters_changed.emit)
+    def _create_rotation_group(self) -> QtWidgets.QGroupBox:
+        group = QtWidgets.QGroupBox("Поворот сцены (градусы)")
+        form = QtWidgets.QGridLayout(group)
+        self.angle_x = self._spin(maximum=360)
+        self.angle_y = self._spin(maximum=360)
+        self.angle_z = self._spin(maximum=360)
+        form.addWidget(QtWidgets.QLabel("X"), 0, 0)
+        form.addWidget(self.angle_x, 0, 1)
+        form.addWidget(QtWidgets.QLabel("Y"), 1, 0)
+        form.addWidget(self.angle_y, 1, 1)
+        form.addWidget(QtWidgets.QLabel("Z"), 2, 0)
+        form.addWidget(self.angle_z, 2, 1)
+        btn = QtWidgets.QPushButton("Повернуть сцену")
+        btn.clicked.connect(self._emit_rotate)
+        form.addWidget(btn, 3, 0, 1, 2)
+        return group
 
-        grid.addWidget(QtWidgets.QLabel("Радиус"), 0, 0)
-        grid.addWidget(self.orbit_radius, 0, 1)
-        grid.addWidget(QtWidgets.QLabel("Скорость (рад/с)"), 1, 0)
-        grid.addWidget(self.orbit_speed, 1, 1)
-        grid.addWidget(apply, 2, 0, 1, 2)
+    def _emit_rotate(self) -> None:
+        dx, dy, dz = self.angle_x.value(), self.angle_y.value(), self.angle_z.value()
+        self.scene_rotated.emit(dx, dy, dz)
+        self.angle_x.setValue(0.0)
+        self.angle_y.setValue(0.0)
+        self.angle_z.setValue(0.0)
 
-        return g
+    def _create_scaling_group(self) -> QtWidgets.QGroupBox:
+        group = QtWidgets.QGroupBox("Масштабирование (равномерно)")
+        form = QtWidgets.QGridLayout(group)
+        self.scale_box = self._spin(value=1.0, minimum=0.1, maximum=10.0, step=0.1)
+        form.addWidget(QtWidgets.QLabel("scale"), 0, 0)
+        form.addWidget(self.scale_box, 0, 1)
+        btn = QtWidgets.QPushButton("Масштабировать")
+        btn.clicked.connect(self.parameters_changed.emit)
+        form.addWidget(btn, 1, 0, 1, 2)
+        return group
 
-    def _camera_group(self):
-        g = QtWidgets.QGroupBox("Камера")
-        grid = QtWidgets.QGridLayout(g)
+    def _create_orbit_group(self) -> QtWidgets.QGroupBox:
+        group = QtWidgets.QGroupBox("Параметры орбиты и Seed")
+        form = QtWidgets.QGridLayout(group)
+        self.orbit_radius = self._spin(value=4.0, minimum=1.5, maximum=12.0)
+        self.orbit_speed = self._spin(value=1.2, minimum=0.0, maximum=6.0)
+        self.seed_box = QtWidgets.QSpinBox()
+        self.seed_box.setRange(0, 10000)
+        self.seed_box.setValue(1)
+        form.addWidget(QtWidgets.QLabel("Радиус"), 0, 0)
+        form.addWidget(self.orbit_radius, 0, 1)
+        form.addWidget(QtWidgets.QLabel("Скорость (рад/с)"), 1, 0)
+        form.addWidget(self.orbit_speed, 1, 1)
+        form.addWidget(QtWidgets.QLabel("Seed"), 2, 0)
+        form.addWidget(self.seed_box, 2, 1)
+        btn_apply = QtWidgets.QPushButton("Применить")
+        btn_apply.clicked.connect(self._apply_clicked)
+        form.addWidget(btn_apply, 3, 0, 1, 2)
+        self.record_button = QtWidgets.QPushButton("Начать запись")
+        self.record_button.setCheckable(True)
+        self.record_button.toggled.connect(self.record_toggled)
+        form.addWidget(self.record_button, 4, 0, 1, 2)
+        return group
 
-        self.cam_yaw = self._spin(90.0, -360, 360, 1.0)
-        self.cam_pitch = self._spin(0.0, -89, 89, 1.0)
-        self.cam_zoom = self._spin(8.0, 1.5, 50.0, 0.1)
+    def _apply_clicked(self) -> None:
+        self.parameters_changed.emit()
+        self.seed_changed.emit(self.seed_box.value())
 
-        apply = QtWidgets.QPushButton("Применить")
-        apply.clicked.connect(self.parameters_changed.emit)
-
-        grid.addWidget(QtWidgets.QLabel("Yaw (°)"), 0, 0)
-        grid.addWidget(self.cam_yaw, 0, 1)
-        grid.addWidget(QtWidgets.QLabel("Pitch (°)"), 1, 0)
-        grid.addWidget(self.cam_pitch, 1, 1)
-        grid.addWidget(QtWidgets.QLabel("Distance"), 2, 0)
-        grid.addWidget(self.cam_zoom, 2, 1)
-
-        grid.addWidget(apply, 3, 0, 1, 2)
-
-        return g
-
-    def _seed_group(self):
-        g = QtWidgets.QGroupBox("Генерация планеты (seed)")
-        grid = QtWidgets.QGridLayout(g)
-
-        self.seed = QtWidgets.QSpinBox()
-        self.seed.setRange(0, 100000)
-        self.seed.setValue(1)
-
-        apply = QtWidgets.QPushButton("Перегенерировать")
-        apply.clicked.connect(self._emit_seed)
-
-        grid.addWidget(QtWidgets.QLabel("Seed"), 0, 0)
-        grid.addWidget(self.seed, 0, 1)
-        grid.addWidget(apply, 1, 0, 1, 2)
-        return g
-
-    def _emit_seed(self):
-        self.seed_changed.emit(self.seed.value())
-
-
-# ============================================================
-# MAIN WINDOW
-# ============================================================
 
 class MainWindow(QtWidgets.QMainWindow):
+    BASE_WIDTH = 1200
+    BASE_HEIGHT = 720
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Satellite Visualiser — FIXED")
-        self.resize(1200, 750)
+        self.setWindowTitle("Satellite Visualiser (software renderer)")
+        self.setMinimumSize(self.BASE_WIDTH, self.BASE_HEIGHT)
+        self.resize(self.BASE_WIDTH, self.BASE_HEIGHT)
 
         self.ui_state = UiState()
+
+        self.camera = Camera(distance=8.0, yaw=math.radians(90.0), pitch=0.0)
+        self.camera.target[:] = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+
         self.planet = Planet(PlanetConfig())
         self.planet.generate(self.ui_state.seed)
+        self.orbit = OrbitSimulator(OrbitParameters(radius=4.0, angular_velocity=1.2))
+        light_dir = np.array([-1.0, 0.0, 0.0], dtype=np.float32)
+        self.light = Light(light_dir, np.array([1.0, 0.98, 0.92], dtype=np.float32))
+        self.settings = RenderSettings(width=256, height=144)
 
-        self.camera = Camera()
-        self.camera.target[:] = np.array([0,0,0], dtype=np.float32)
+        self.renderer = SoftwareRendererWidget(self.planet, self.orbit, self.light, self.camera, self.settings)
 
-        self.orbit = OrbitSimulator(OrbitParameters(4.0, 1.2))
-        self.settings = RenderSettings()
-
-        self.gl = GLMeshWidget(self.planet, self.orbit, self.camera, self.settings)
         self.panel = ControlPanel()
+        self.render_widget = RenderWidget(self.renderer)
+        splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
+        splitter.addWidget(self.panel)
+        splitter.addWidget(self.render_widget)
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        self.panel.setMinimumWidth(300)
+        splitter.setSizes([300, self.BASE_WIDTH - 300])
+        self.setCentralWidget(splitter)
+
+        QtGui.QShortcut(QtGui.QKeySequence("0"), self, activated=lambda: self._set_quality("ULTRA"))
+        QtGui.QShortcut(QtGui.QKeySequence("1"), self, activated=lambda: self._set_quality("FAST"))
+        QtGui.QShortcut(QtGui.QKeySequence("2"), self, activated=lambda: self._set_quality("BALANCED"))
+        QtGui.QShortcut(QtGui.QKeySequence("3"), self, activated=lambda: self._set_quality("HIGH"))
 
         self.panel.parameters_changed.connect(self._apply_controls)
         self.panel.seed_changed.connect(self._regenerate_planet)
+        self.panel.scene_rotated.connect(self._rotate_scene)
+        self.panel.scene_translated.connect(self._translate_scene)
+        self.panel.record_toggled.connect(self._toggle_recording)
 
-        sp = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
-        sp.addWidget(self.panel)
-        sp.addWidget(self.gl)
-        sp.setStretchFactor(1, 1)
-        self.setCentralWidget(sp)
+        self.statusBar().showMessage(
+            "Готово (software). Качество: 0=ULTRA, 1=FAST (по умолчанию), 2=BALANCED, 3=HIGH. Поворот/перенос — у сцены."
+        )
 
-    def _apply_controls(self):
-        self.orbit.set_radius(float(self.panel.orbit_radius.value()))
-        self.orbit.set_speed(float(self.panel.orbit_speed.value()))
-        self.camera.yaw = math.radians(float(self.panel.cam_yaw.value()))
-        self.camera.pitch = math.radians(float(self.panel.cam_pitch.value()))
-        self.camera.distance = float(self.panel.cam_zoom.value())
+        QtCore.QTimer.singleShot(0, self._center_on_screen)
 
-    def _regenerate_planet(self, seed: int):
+    def _center_on_screen(self) -> None:
+        screen = self.screen() or QtWidgets.QApplication.primaryScreen()
+        if screen is None:
+            return
+        geo = self.frameGeometry()
+        geo.moveCenter(screen.availableGeometry().center())
+        self.move(geo.topLeft())
+
+    def _set_quality(self, preset: str) -> None:
+        if preset == "ULTRA":
+            self.settings.width, self.settings.height = 192, 108
+        elif preset == "FAST":
+            self.settings.width, self.settings.height = 256, 144
+        elif preset == "HIGH":
+            self.settings.width, self.settings.height = 800, 450
+        else:
+            self.settings.width, self.settings.height = 480, 270
+        self.statusBar().showMessage(f"Качество: {preset}. Поворот/перенос — у сцены.")
+
+    def _apply_controls(self) -> None:
+        scale = max(float(self.panel.scale_box.value()), 0.1)
+        self.camera.distance = float(np.clip(self.camera.distance / scale, 1.5, 50.0))
+        self.panel.scale_box.setValue(1.0)
+        self.orbit.set_radius(self.panel.orbit_radius.value())
+        self.orbit.set_speed(self.panel.orbit_speed.value())
+        self.renderer.update_planet_mesh()
+
+    def _rotate_scene(self, dx: float, dy: float, dz: float) -> None:
+        self.renderer.rotate_scene_euler_deg(dx, dy, dz)
+
+    def _translate_scene(self, dx: float, dy: float, dz: float) -> None:
+        self.renderer.translate_scene(dx, dy, dz)
+
+    def _regenerate_planet(self, seed: int) -> None:
         self.planet.generate(seed)
-        self.gl.makeCurrent()
-        self.gl._upload_height()
-        self.gl.doneCurrent()
+        self.renderer.update_planet_mesh()
+
+    def _toggle_recording(self, active: bool) -> None:
+        self.ui_state.recording = active
+        self.panel.record_button.setText("Остановить запись" if active else "Начать запись")
+        if active:
+            self.ui_state.frame_index = 0
+            Path("frames").mkdir(exist_ok=True)
+            self.renderer.set_record_callback(self._save_frame)
+        else:
+            self.renderer.set_record_callback(None)
+
+    def _save_frame(self, image: np.ndarray) -> None:
+        out = Path("frames")
+        out.mkdir(exist_ok=True)
+        fname = out / f"frame_{self.ui_state.frame_index:05d}.png"
+        qimage = QtGui.QImage(image.data, image.shape[1], image.shape[0], 3 * image.shape[1], QtGui.QImage.Format.Format_RGB888)
+        qimage.save(str(fname))
+        self.ui_state.frame_index += 1
 
 
-# ============================================================
-# SHADERS (UNCHANGED)
-# ============================================================
+# -------------------------------------------------------------
+# Entry point
+# -------------------------------------------------------------
 
-VS_SCREEN = """
-#version 330 core
-layout(location=0) in vec2 in_pos;
-layout(location=1) in vec2 in_uv;
-out vec2 v_uv;
-void main() {
-    v_uv = in_uv;
-    gl_Position = vec4(in_pos, 0.0, 1.0);
-}
-"""
 
-FS_SKY = """
-#version 330 core
-out vec4 fragColor;
-in vec2 v_uv;
-uniform vec2 uResolution;
-uniform float uTime;
-uniform vec3 uCamFwd;
-uniform vec3 uCamRight;
-uniform vec3 uCamUp;
-float hash21(vec2 p){ p = fract(p*vec2(123.34, 345.45)); p += dot(p, p+34.345); return fract(p.x*p.y); }
-vec2  hash22(vec2 p){ p = fract(p*vec2(443.8975, 441.423)); p += dot(p, p+19.19); return fract(vec2(p.x*p.y, p.x+p.y)); }
-float starDot(vec2 f, vec2 c, float r){ float d = length(f-c); return smoothstep(r, 0.0, d); }
-vec3 starsLayer(vec2 suv, vec2 scale, float existThresh, vec2 rrange, float t){
-    vec2 p = suv*scale; vec2 i = floor(p); vec2 f = fract(p); vec3 col = vec3(0.0);
-    for (int oy=-1; oy<=1; ++oy){
-        for (int ox=-1; ox<=1; ++ox){
-            vec2 cell = i + vec2(ox, oy);
-            float rnd = hash21(cell);
-            float exist = step(existThresh, rnd);
-            vec2 center = hash22(cell);
-            float r = mix(rrange.x, rrange.y, hash21(cell+2.7));
-            float tw = 0.6 + 0.4 * sin(rnd*123.0 + t*(2.0 + 3.0*hash21(cell+5.31)));
-            vec3 sc = vec3(0.85,0.90,1.0);
-            col += sc * starDot(f, center, r) * tw * exist;
-        }
-    }
-    return col;
-}
-void main(){
-    vec2 ndc = vec2(v_uv.x*2.0-1.0, 1.0 - v_uv.y*2.0);
-    vec3 dir = normalize(uCamFwd + ndc.x*uCamRight + ndc.y*uCamUp);
-    float h = clamp(dir.y*0.5 + 0.5, 0.0, 1.0);
-    vec3 bottom = vec3(0.000, 0.002, 0.008);
-    vec3 top    = vec3(0.003, 0.012, 0.030);
-    vec3 base = mix(bottom, top, h);
-    float phi = atan(dir.y, dir.x); if (phi < 0.0) phi += 6.28318530718;
-    float theta = acos(clamp(dir.z, -1.0, 1.0));
-    vec2 suv = vec2(phi / 6.28318530718, theta / 3.1415926535);
-    vec3 s1 = starsLayer(suv, vec2(1200.0, 700.0), 0.940, vec2(0.0035, 0.0068), uTime);
-    vec3 s2 = starsLayer(suv, vec2(2600.0, 1600.0), 0.965, vec2(0.0024, 0.0048), uTime);
-    vec3 s3 = starsLayer(suv, vec2(4200.0, 2500.0), 0.985, vec2(0.0018, 0.0032), uTime);
-    vec3 s4 = starsLayer(suv, vec2(7000.0, 4200.0), 0.992, vec2(0.0012, 0.0020), uTime);
-    vec3 g1 = starsLayer(suv, vec2(1000.0, 600.0), 0.9970, vec2(0.0100, 0.0220), uTime);
-    vec3 g2 = starsLayer(suv, vec2( 800.0, 480.0), 0.9985, vec2(0.0180, 0.0350), uTime);
-    vec3 col = clamp(base + s1 + s2 + s3 + s4 + g1 + g2, 0.0, 1.0);
-    col = pow(col, vec3(1.0/2.2));
-    fragColor = vec4(col, 1.0);
-}
-"""
-
-VS_DEPTH = """
-#version 330 core
-layout(location=0) in vec3 in_pos;
-layout(location=1) in vec2 in_uv;
-uniform mat4 uM;
-uniform mat4 uVP;
-uniform sampler2D uHeightTex;
-uniform float uBaseRadius;
-uniform float uHeightScale;
-out vec3 vWorldPos;
-float heightTex(vec2 uv){ return texture(uHeightTex, uv).r * 2.0 - 1.0; }
-void main(){
-    float h = heightTex(in_uv);
-    float r = uBaseRadius * (1.0 + uHeightScale * h);
-    vec3 world = (uM * vec4(in_pos * r, 1.0)).xyz;
-    vWorldPos = world;
-    gl_Position = uVP * vec4(world, 1.0);
-}
-"""
-
-FS_DEPTH = "#version 330 core\nvoid main(){}\n"
-
-VS_LIT = """
-#version 330 core
-layout(location=0) in vec3 in_pos;
-layout(location=1) in vec2 in_uv;
-uniform mat4 uM;
-uniform mat4 uVP;
-uniform mat4 uLVP;
-uniform sampler2D uHeightTex;
-uniform float uBaseRadius;
-uniform float uHeightScale;
-out vec3 vWorldPos;
-out vec2 vUV;
-out vec4 vShadowPos;
-float heightTex(vec2 uv){ return texture(uHeightTex, uv).r * 2.0 - 1.0; }
-void main(){
-    float h = heightTex(in_uv);
-    float r = uBaseRadius * (1.0 + uHeightScale * h);
-    vec3 world = (uM * vec4(in_pos * r, 1.0)).xyz;
-    vWorldPos = world;
-    vUV = in_uv;
-    vShadowPos = uLVP * vec4(world, 1.0);
-    gl_Position = uVP * vec4(world, 1.0);
-}
-"""
-
-FS_LIT = """
-#version 330 core
-out vec4 fragColor;
-in vec3 vWorldPos;
-in vec2 vUV;
-in vec4 vShadowPos;
-uniform sampler2D uHeightTex;
-uniform sampler2D uShadowMap;
-uniform vec3 uCamPos;
-uniform vec3 uLightDir;
-uniform vec3 uLightI;
-uniform vec3 uBaseColor;
-uniform float uShininess;
-uniform float uIsSatellite;
-uniform float uBaseRadius;
-uniform float uHeightScale;
-float heightTex(vec2 uv){ return texture(uHeightTex, uv).r * 2.0 - 1.0; }
-
-vec3 planetNormal(vec2 uv){
-    float du = 1.0/2048.0;
-    float dv = 1.0/1024.0;
-
-    float h  = heightTex(uv);
-    float hU = heightTex(uv + vec2(du,0));
-    float hV = heightTex(uv + vec2(0,dv));
-
-    float r  = uBaseRadius * (1.0 + uHeightScale * h);
-    float rU = uBaseRadius * (1.0 + uHeightScale * hU);
-    float rV = uBaseRadius * (1.0 + uHeightScale * hV);
-
-    float theta = uv.x * 6.28318530718;
-    float phi   = uv.y * 3.1415926535;
-
-    vec3 dir  = vec3(sin(phi)*cos(theta), cos(phi), sin(phi)*sin(theta));
-    vec3 dirU = vec3(sin(phi)*cos(theta+du*6.2831), cos(phi), sin(phi)*sin(theta+du*6.2831));
-    vec3 dirV = vec3(sin(phi+dv*3.1415)*cos(theta), cos(phi+dv*3.1415), sin(phi+dv*3
-
-    vec3 dirV = vec3(sin(phi+dv*3.1415)*cos(theta),
-                     cos(phi+dv*3.1415),
-                     sin(phi+dv*3.1415)*sin(theta));
-
-    vec3 p  = dir  * r;
-    vec3 pU = dirU * rU;
-    vec3 pV = dirV * rV;
-
-    vec3 tU = normalize(pU - p);
-    vec3 tV = normalize(pV - p);
-    vec3 n = normalize(cross(tU, tV));
-    return n;
-}
-
-float shadowPCF(vec4 shadowPos){
-    vec3 sp = shadowPos.xyz / shadowPos.w;
-    vec3 uvz = sp * 0.5 + 0.5;
-
-    if (uvz.x < 0.0 || uvz.x > 1.0 ||
-        uvz.y < 0.0 || uvz.y > 1.0)
-        return 1.0;
-
-    float current = uvz.z;
-    float bias = 0.0015;
-
-    vec2 texel = 1.0 / vec2(textureSize(uShadowMap, 0));
-    float occl = 0.0;
-
-    for (int oy=-1; oy<=1; ++oy){
-        for (int ox=-1; ox<=1; ++ox){
-            float p = texture(uShadowMap, uvz.xy + vec2(ox,oy)*texel).r;
-            occl += (current - bias > p) ? 1.0 : 0.0;
-        }
-    }
-    return 1.0 - occl/9.0;
-}
-
-void main(){
-    vec3 V = normalize(uCamPos - vWorldPos);
-    vec3 L = normalize(-uLightDir);
-    vec3 N;
-
-    if (uIsSatellite > 0.5)
-    {
-        N = normalize(vWorldPos);
-    }
-    else
-    {
-        N = planetNormal(vUV);
-    }
-
-    float diff = max(dot(N, L), 0.0);
-    vec3 R = reflect(-L, N);
-    float spec = pow(max(dot(R, V), 0.0), uShininess);
-    float amb = 0.08;
-
-    float sh = shadowPCF(vShadowPos);
-
-    float lightTerm = amb + sh * diff;
-    vec3 col = uBaseColor * lightTerm + sh * 0.25 * spec * vec3(1.0);
-
-    col *= uLightI;
-    col = pow(clamp(col, 0.0, 1.0), vec3(1.0/2.2));
-
-    fragColor = vec4(col, 1.0);
-}
-"""
-
-FS_AXES = """
-#version 330 core
-out vec4 fragColor;
-in vec2 v_uv;
-
-uniform vec2 uResolution;
-uniform vec3 uCamRight;
-uniform vec3 uCamUp;
-uniform vec3 uWorldX;
-uniform vec3 uWorldY;
-uniform vec3 uWorldZ;
-
-float sdSegment(vec2 p, vec2 a, vec2 b){
-    vec2 pa = p - a;
-    vec2 ba = b - a;
-    float h = clamp(dot(pa, ba) / max(dot(ba, ba), 1e-6), 0.0, 1.0);
-    return length(pa - ba*h);
-}
-
-vec2 proj(vec3 w){
-    return vec2(dot(w, uCamRight), dot(w, uCamUp));
-}
-
-vec3 drawAxis(vec2 uv, vec2 base, vec2 d, vec3 col, float len, float thick){
-    if (length(d) < 1e-6)
-        return vec3(0.0);
-
-    vec2 nd = normalize(d);
-    vec2 tip = base + nd * len;
-
-    float aLine = 1.0 - smoothstep(thick, thick+0.002, sdSegment(uv, base, tip));
-
-    vec2 perp = vec2(-nd.y, nd.x);
-    vec2 a1 = tip - nd*0.020 + perp*0.012;
-    vec2 a2 = tip - nd*0.020 - perp*0.012;
-
-    float aHead = 1.0 - smoothstep(thick, thick+0.002,
-        min(sdSegment(uv, tip, a1), sdSegment(uv, tip, a2)));
-
-    return col * (aLine + aHead);
-}
-
-void main(){
-    vec2 uv = v_uv;
-
-    vec2 base = vec2(0.080, 0.150);
-    float len = 0.110;
-    float thick = 0.0018;
-
-    vec2 ex = proj(uWorldX);
-    vec2 ey = proj(uWorldY);
-    vec2 ez = proj(uWorldZ);
-
-    vec3 col = vec3(0.0);
-    col += drawAxis(uv, base, ex, vec3(1.0, 0.10, 0.10), len, thick);
-    col += drawAxis(uv, base, ey, vec3(0.10, 1.0, 0.10), len, thick);
-    col += drawAxis(uv, base, ez, vec3(0.10, 0.40, 1.0), len, thick);
-
-    fragColor = vec4(clamp(col, 0.0, 1.0), 1.0);
-}
-"""
-
-# ============================================================
-# RUN APPLICATION
-# ============================================================
-
-def run():
+def run() -> None:
     import sys
-    from PyQt6.QtGui import QSurfaceFormat
 
-    fmt = QSurfaceFormat()
-    fmt.setRenderableType(QSurfaceFormat.RenderableType.OpenGL)
-    fmt.setProfile(QSurfaceFormat.OpenGLContextProfile.CoreProfile)
-    fmt.setVersion(3, 3)
-    fmt.setDepthBufferSize(24)
-    fmt.setStencilBufferSize(8)
-    fmt.setSamples(4)
-
-    QSurfaceFormat.setDefaultFormat(fmt)
-
+    os.environ["QT_LOGGING_RULES"] = "qt.qpa.*=false"
     app = QtWidgets.QApplication(sys.argv)
     app.setStyle("Fusion")
     win = MainWindow()
